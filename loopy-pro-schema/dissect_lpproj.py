@@ -3,16 +3,26 @@
 Loopy Pro Project File Dissector
 =================================
 
-Loopy Pro (.lpproj.zip) files are ZIP archives containing a project bundle.
-This script extracts and analyzes the internal structure to reverse-engineer
-the schema.
+Loopy Pro projects are Apple "document bundles" (directories that appear as
+single files in Finder/Files app). They contain XML configuration data,
+audio files (AAC/M4A by default, or WAV/AIFF if uncompressed), layout data,
+and MIDI binding info.
+
+On-device, they live as directory bundles. When shared/exported, they are
+typically zipped into .lpproj.zip files.
+
+Related extensions:
+    .lpsession   - Loopy HD session bundles
+    .lprecording - Session recording bundles
+
+This script handles both:
+    - ZIP-archived bundles (.lpproj.zip downloaded from web)
+    - Directory bundles (macOS "Show Package Contents" or iOS file access)
 
 Usage:
     python3 dissect_lpproj.py <path_to_file.lpproj.zip>
-    python3 dissect_lpproj.py <path_to_file.lpproj>
-
-If you have a .lpproj file that isn't a zip (it's a directory/bundle on macOS),
-point this script at the directory and it will analyze it directly.
+    python3 dissect_lpproj.py <path_to_bundle_directory.lpproj>
+    python3 dissect_lpproj.py <path_to_file.lpsession>
 
 Where to get sample files:
     - Patchstorage: https://patchstorage.com/platform/loopy-pro/
@@ -21,6 +31,7 @@ Where to get sample files:
     - Sample Projects 2.0: https://wiki.loopypro.com/Sample_Projects_2.0
     - In-app: Loopy Pro ships with built-in sample projects
     - On-device: ~/Documents/Loopy Pro/ (iOS Files app)
+    - macOS: Right-click project in Finder -> "Show Package Contents"
 """
 
 import sys
@@ -67,8 +78,8 @@ def analyze_binary_data(data: bytes, name: str) -> dict:
             info["parse_error"] = str(e)
         return info
 
-    # XML plist
-    if data[:5] == b'<?xml' or b'<!DOCTYPE plist' in data[:200]:
+    # XML plist (must have DOCTYPE plist or <plist tag)
+    if data[:5] == b'<?xml' and (b'<!DOCTYPE plist' in data[:500] or b'<plist' in data[:500]):
         info["format"] = "xml_plist"
         try:
             parsed = plistlib.loads(data)
@@ -78,6 +89,24 @@ def analyze_binary_data(data: bytes, name: str) -> dict:
                 info["content"] = summarize_plist(parsed)
         except Exception as e:
             info["parse_error"] = str(e)
+        return info
+
+    # Generic XML (not plist) - Loopy Pro uses XML for session config
+    if data[:5] == b'<?xml' or (data[:1] == b'<' and b'</' in data[:500]):
+        info["format"] = "xml"
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(data)
+            info["root_tag"] = root.tag
+            info["root_attribs"] = dict(root.attrib) if root.attrib else {}
+            children = list(root)
+            info["child_tags"] = [c.tag for c in children[:20]]
+            info["child_count"] = len(children)
+            if len(data) < 50000:
+                info["xml_text_preview"] = data.decode('utf-8', errors='replace')[:2000]
+        except Exception as e:
+            info["parse_error"] = str(e)
+            info["text_preview"] = data.decode('utf-8', errors='replace')[:500]
         return info
 
     # JSON
@@ -114,6 +143,19 @@ def analyze_binary_data(data: bytes, name: str) -> dict:
     # AIFF
     if data[:4] == b'FORM' and data[8:12] in (b'AIFF', b'AIFC'):
         info["format"] = "aiff_audio"
+        return info
+
+    # AAC/M4A/MP4 container (ftyp box) - Loopy Pro default audio format
+    if len(data) >= 12 and data[4:8] == b'ftyp':
+        ftyp_brand = data[8:12].decode('ascii', errors='replace')
+        info["format"] = "aac_m4a_mp4"
+        info["ftyp_brand"] = ftyp_brand
+        if ftyp_brand in ('M4A ', 'mp41', 'mp42', 'isom'):
+            info["likely_content"] = "audio (AAC)"
+        elif ftyp_brand in ('M4V ', 'mp4v'):
+            info["likely_content"] = "video"
+        else:
+            info["likely_content"] = f"media (brand: {ftyp_brand})"
         return info
 
     # MIDI
@@ -369,6 +411,20 @@ def print_analysis(file_analysis: dict):
                 if k in analysis:
                     print(f"  {k}: {analysis[k]}")
 
+        elif fmt == "aac_m4a_mp4":
+            print(f"  ftyp brand: {analysis.get('ftyp_brand', 'unknown')}")
+            print(f"  Likely content: {analysis.get('likely_content', 'unknown')}")
+
+        elif fmt == "xml":
+            print(f"  Root tag: {analysis.get('root_tag', 'unknown')}")
+            if analysis.get('root_attribs'):
+                print(f"  Root attributes: {analysis['root_attribs']}")
+            if analysis.get('child_tags'):
+                print(f"  Child tags ({analysis.get('child_count', '?')}): {analysis['child_tags']}")
+            if analysis.get('xml_text_preview'):
+                print(f"  Content preview:")
+                print(analysis['xml_text_preview'][:2000])
+
         elif fmt == "unknown_binary":
             print(f"  Magic (hex): {analysis.get('magic_hex', '')}")
             print(f"  Magic (ascii): {analysis.get('magic_ascii', '')}")
@@ -395,6 +451,14 @@ def extract_schema(file_analysis: dict) -> dict:
                 entry["keys"] = analysis["top_level_keys"]
             if "content" in analysis:
                 entry["schema"] = infer_types(analysis["content"])
+
+        elif fmt == "xml":
+            entry["root_tag"] = analysis.get("root_tag")
+            entry["child_tags"] = analysis.get("child_tags")
+
+        elif fmt == "aac_m4a_mp4":
+            entry["ftyp_brand"] = analysis.get("ftyp_brand")
+            entry["likely_content"] = analysis.get("likely_content")
 
         elif fmt in ("wav_audio", "caf_audio", "aiff_audio"):
             for k in ("channels", "sample_rate", "bits_per_sample"):
